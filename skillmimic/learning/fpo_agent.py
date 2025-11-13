@@ -45,7 +45,7 @@ import learning.common_agent as common_agent
 
 from tensorboardX import SummaryWriter
 
-class SkillMimicAgent(common_agent.CommonAgent):
+class FPOAgent(common_agent.CommonAgent):
     def __init__(self, base_name, config):
         super().__init__(base_name, config)
 
@@ -64,9 +64,14 @@ class SkillMimicAgent(common_agent.CommonAgent):
     def init_tensors(self):
         super().init_tensors()
         self._build_rand_action_probs()
+        device = self.ppo_device
+        self.update_list = ['actions', 'values', 'flow_matching_loss', 'rand_action_mask']
         batch_shape = self.experience_buffer.obs_base_shape
         self.experience_buffer.tensor_dict['rand_action_mask'] = torch.zeros(batch_shape, dtype=torch.float32, device=self.ppo_device)
-        self.tensor_list += ['amp_obs', 'rand_action_mask']
+        self.experience_buffer.tensor_dict['flow_matching_loss'] = torch.zeros(
+            batch_shape, dtype=torch.float32, device=device
+        )
+        self.tensor_list += ['amp_obs', 'rand_action_mask', 'flow_matching_loss']
         return
     
     def set_eval(self):
@@ -118,7 +123,7 @@ class SkillMimicAgent(common_agent.CommonAgent):
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
-                res_dict = self.get_action_values(self.obs, self._rand_action_probs)
+                res_dict = self.get_action_values(self.obs, num_integration_steps=1000)
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k]) 
@@ -174,43 +179,75 @@ class SkillMimicAgent(common_agent.CommonAgent):
         return batch_dict
 
 
-    def get_action_values(self, obs_dict, rand_action_probs):
-        processed_obs = self._preproc_obs(obs_dict['obs'])
-
+    def get_action_values(self, obs_dict, num_integration_steps=100):
+        """
+        Flow Matching inference with multi-step integration
+        """
         self.model.eval()
-        input_dict = {
-            'is_train': False,
-            'prev_actions': None, 
-            'obs' : processed_obs,
-            'rnn_states' : self.rnn_states
-        }
+        processed_obs = self._preproc_obs(obs_dict['obs'])
+        device = processed_obs.device
 
+        # 用多步積分 sample 出 action
+        actions = self.model.sample_action(processed_obs, num_steps=num_integration_steps)
+        obs_dict['actions'] = actions
+
+        # 估計 value（不影響 policy）
         with torch.no_grad():
-            res_dict = self.model(input_dict)
-            if self.has_central_value:
-                states = obs_dict['states']
-                input_dict = {
-                    'is_train': False,
-                    'states' : states,
-                }
-                value = self.get_central_value(input_dict)
-                res_dict['values'] = value
+            res_dict = self.model(obs_dict)
 
-        if self.normalize_value:
-            res_dict['values'] = self.value_mean_std(res_dict['values'], True)
-        
-        rand_action_mask = torch.bernoulli(rand_action_probs)
-        det_action_mask = rand_action_mask == 0.0
-        res_dict['actions'][det_action_mask] = res_dict['mus'][det_action_mask]
+        rand_action_mask = torch.ones_like(res_dict['values']).squeeze(-1)
+        res_dict['actions'] = actions
         res_dict['rand_action_mask'] = rand_action_mask
 
         return res_dict
 
     def prepare_dataset(self, batch_dict):
-        super().prepare_dataset(batch_dict)
         rand_action_mask = batch_dict['rand_action_mask']
-        self.dataset.values_dict['rand_action_mask'] = rand_action_mask
+        obses = batch_dict['obses']
+        returns = batch_dict['returns']
+        dones = batch_dict['dones']
+        values = batch_dict['values']
+        actions = batch_dict['actions']
+        flow_matching_loss = batch_dict['flow_matching_loss']
+        rnn_states = batch_dict.get('rnn_states', None)
+        rnn_masks = batch_dict.get('rnn_masks', None)
+        
+        advantages = self._calc_advs(batch_dict)
+        if self.normalize_value:
+            values = self.value_mean_std(values)
+            returns = self.value_mean_std(returns)
+
+        dataset_dict = {}
+        dataset_dict['old_values'] = values
+        dataset_dict['old_flow_matching_loss'] = flow_matching_loss
+        dataset_dict['advantages'] = advantages
+        dataset_dict['returns'] = returns
+        dataset_dict['actions'] = actions
+        dataset_dict['obs'] = obses
+        dataset_dict['rnn_states'] = rnn_states
+        dataset_dict['rnn_masks'] = rnn_masks
+        dataset_dict['rand_action_mask'] = rand_action_mask
+
+        self.dataset.update_values_dict(dataset_dict)
+
+        if self.has_central_value:
+            dataset_dict = {}
+            dataset_dict['old_values'] = values
+            dataset_dict['advantages'] = advantages
+            dataset_dict['returns'] = returns
+            dataset_dict['actions'] = actions
+            dataset_dict['obs'] = batch_dict['states']
+            dataset_dict['rnn_masks'] = rnn_masks
+            dataset_dict['rand_action_mask'] = rand_action_mask
+            self.central_value_net.update_dataset(dataset_dict)
+
         return
+    
+    def train_fpo(self, input_dict):
+        self.set_train()
+        self.calc_gradients(input_dict)
+
+        return self.train_result
     
     def train_epoch(self):
         play_time_start = time.time()
@@ -229,25 +266,19 @@ class SkillMimicAgent(common_agent.CommonAgent):
         self.prepare_dataset(batch_dict)
         self.algo_observer.after_steps()
 
-        if self.has_central_value:
-            self.train_central_value()
+        # if self.has_central_value:
+        #     self.train_central_value()
 
         train_info = None
 
-        if self.is_rnn:
-            frames_mask_ratio = rnn_masks.sum().item() / (rnn_masks.nelement())
-            print(frames_mask_ratio)
+        # if self.is_rnn:
+        #     frames_mask_ratio = rnn_masks.sum().item() / (rnn_masks.nelement())
+        #     print(frames_mask_ratio)
 
         for _ in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                curr_train_info = self.train_actor_critic(self.dataset[i]) # updating
-                
-                if self.schedule_type == 'legacy':  
-                    if self.multi_gpu:
-                        curr_train_info['kl'] = self.hvd.average_value(curr_train_info['kl'], 'ep_kls')
-                    self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, curr_train_info['kl'].item())
-                    self.update_lr(self.last_lr)
+                curr_train_info = self.train_fpo(self.dataset[i])
 
                 if (train_info is None):
                     train_info = dict()
@@ -256,20 +287,6 @@ class SkillMimicAgent(common_agent.CommonAgent):
                 else:
                     for k, v in curr_train_info.items():
                         train_info[k].append(v)
-            
-            av_kls = torch_ext.mean_list(train_info['kl'])
-
-            if self.schedule_type == 'standard':
-                if self.multi_gpu:
-                    av_kls = self.hvd.average_value(av_kls, 'ep_kls')
-                self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                self.update_lr(self.last_lr)
-
-        if self.schedule_type == 'standard_epoch':
-            if self.multi_gpu:
-                av_kls = self.hvd.average_value(torch_ext.mean_list(kls), 'ep_kls')
-            self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-            self.update_lr(self.last_lr)
 
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
@@ -283,19 +300,17 @@ class SkillMimicAgent(common_agent.CommonAgent):
 
         return train_info
 
+    # DONE
     def calc_gradients(self, input_dict):
         self.set_train()
 
         value_preds_batch = input_dict['old_values']
-        old_action_log_probs_batch = input_dict['old_logp_actions']
+        old_flow_matching_loss_batch = input_dict['old_flow_matching_loss']
         advantage = input_dict['advantages']
-        old_mu_batch = input_dict['mu']
-        old_sigma_batch = input_dict['sigma']
         return_batch = input_dict['returns']
         actions_batch = input_dict['actions']
         obs_batch = input_dict['obs']
         obs_batch = self._preproc_obs(obs_batch)
-        
         rand_action_mask = input_dict['rand_action_mask']
         rand_action_sum = torch.sum(rand_action_mask)
 
@@ -306,7 +321,7 @@ class SkillMimicAgent(common_agent.CommonAgent):
 
         batch_dict = {
             'is_train': True,
-            'prev_actions': actions_batch, 
+            'actions': actions_batch, 
             'obs' : obs_batch
         }
 
@@ -318,31 +333,28 @@ class SkillMimicAgent(common_agent.CommonAgent):
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)
-            action_log_probs = res_dict['prev_neglogp']
+            new_flow_matching_loss = res_dict['flow_matching_loss']
             values = res_dict['values']
             entropy = res_dict['entropy']
-            mu = res_dict['mus']
-            sigma = res_dict['sigmas']
 
-            a_info = self._actor_loss(old_action_log_probs_batch, action_log_probs, advantage, curr_e_clip)
-            a_loss = a_info['actor_loss']
-            a_clipped = a_info['actor_clipped'].float()
-
+            fpo_info = self._fpo_loss(old_flow_matching_loss_batch, new_flow_matching_loss, advantage, curr_e_clip)
+            f_loss = fpo_info['fpo_loss']
+            f_clipped = fpo_info['fpo_clipped'].float()
             c_info = self._critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
             c_loss = c_info['critic_loss']
 
-            b_loss = self.bound_loss(mu)
+            # b_loss = self.bound_loss(mu)
             
             c_loss = torch.mean(c_loss)
-            a_loss = torch.sum(rand_action_mask * a_loss) / rand_action_sum
+            f_loss = torch.sum(rand_action_mask * f_loss) / rand_action_sum
             entropy = torch.sum(rand_action_mask * entropy) / rand_action_sum
-            b_loss = torch.sum(rand_action_mask * b_loss) / rand_action_sum
-            a_clip_frac = torch.sum(rand_action_mask * a_clipped) / rand_action_sum
+            # b_loss = torch.sum(rand_action_mask * b_loss) / rand_action_sum
+            f_clip_frac = torch.sum(rand_action_mask * f_clipped) / rand_action_sum
             
-            loss = a_loss + self.critic_coef * c_loss + self.bounds_loss_coef * b_loss
-            
-            a_info['actor_loss'] = a_loss
-            a_info['actor_clip_frac'] = a_clip_frac
+            loss = f_loss - self.entropy_coef * entropy + c_loss * self.critic_coef
+
+            fpo_info['fpo_loss'] = f_loss
+            fpo_info['fpo_clip_frac'] = f_clip_frac
             c_info['critic_loss'] = c_loss
 
             if self.multi_gpu:
@@ -369,20 +381,17 @@ class SkillMimicAgent(common_agent.CommonAgent):
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-        with torch.no_grad():
-            reduce_kl = not self.is_rnn
-            kl_dist = torch_ext.policy_kl(mu.detach(), sigma.detach(), old_mu_batch, old_sigma_batch, reduce_kl)
-            if self.is_rnn:
-                kl_dist = (kl_dist * rnn_masks).sum() / rnn_masks.numel()  #/ sum_mask
+        # with torch.no_grad():
+            # compute KL
                     
         self.train_result = {
             'entropy': entropy,
-            'kl': kl_dist,
             'last_lr': self.last_lr, 
             'lr_mul': lr_mul, 
-            'b_loss': b_loss
+            'loss': loss
+            # 'b_loss': b_loss
         }
-        self.train_result.update(a_info)
+        self.train_result.update(fpo_info)
         self.train_result.update(c_info)
 
         return
@@ -423,7 +432,7 @@ class SkillMimicAgent(common_agent.CommonAgent):
         super()._init_train()
         return
 
-    
+    # DONE
     def _calc_advs(self, batch_dict):
         returns = batch_dict['returns']
         values = batch_dict['values']
@@ -436,6 +445,7 @@ class SkillMimicAgent(common_agent.CommonAgent):
 
         return advantages
     
+    # DONE
     def _record_train_batch_info(self, batch_dict, train_info):
         super()._record_train_batch_info(batch_dict, train_info)
         return
@@ -444,50 +454,87 @@ class SkillMimicAgent(common_agent.CommonAgent):
     def _log_train_info(self, train_info, frame):
         self.writer.add_scalar('performance/update_time', train_info['update_time'], frame)
         self.writer.add_scalar('performance/play_time', train_info['play_time'], frame)
-        self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(train_info['actor_loss']).item(), frame)
-        self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(train_info['critic_loss']).item(), frame)
+        # self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(train_info['actor_loss']).item(), frame)
+        self.writer.add_scalar('losses/fpo_loss', torch_ext.mean_list(train_info['fpo_loss']).item(), frame)
+        self.writer.add_scalar('losses/fpo_ratio', torch_ext.mean_list(train_info['fpo_ratio']).item(), frame)
         self.writer.add_scalar('losses/advantage', torch_ext.mean_list(train_info['advantage']).item(), frame)
         self.writer.add_scalar('losses/diff', torch_ext.mean_list(train_info['diff']).item(), frame)
+        self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(train_info['critic_loss']).item(), frame)
+        self.writer.add_scalar('losses/total_loss', torch_ext.mean_list(train_info['loss']).item(), frame)
         
-        self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(train_info['b_loss']).item(), frame)
+        # self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(train_info['b_loss']).item(), frame)
         self.writer.add_scalar('losses/entropy', torch_ext.mean_list(train_info['entropy']).item(), frame)
         self.writer.add_scalar('info/last_lr', train_info['last_lr'][-1] * train_info['lr_mul'][-1], frame)
         self.writer.add_scalar('info/lr_mul', train_info['lr_mul'][-1], frame)
         self.writer.add_scalar('info/e_clip', self.e_clip * train_info['lr_mul'][-1], frame)
-        self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['actor_clip_frac']).item(), frame)
-        self.writer.add_scalar('info/kl', torch_ext.mean_list(train_info['kl']).item(), frame)
+        self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['fpo_clip_frac']).item(), frame)
+        # self.writer.add_scalar('info/kl', torch_ext.mean_list(train_info['kl']).item(), frame)
         return
     
-    def _actor_loss(self, old_action_log_probs_batch, action_log_probs, advantage, curr_e_clip):
-        # Convert all input tensors to torch.float64
-        old_action_log_probs_batch = old_action_log_probs_batch.to(torch.float64)
-        action_log_probs = action_log_probs.to(torch.float64)
+    # def _actor_loss(self, old_action_log_probs_batch, action_log_probs, advantage, curr_e_clip):
+    #     # Convert all input tensors to torch.float64
+    #     old_action_log_probs_batch = old_action_log_probs_batch.to(torch.float64)
+    #     action_log_probs = action_log_probs.to(torch.float64)
+    #     advantage = advantage.to(torch.float64)
+    #     curr_e_clip = float(curr_e_clip)  # Ensure curr_e_clip is a float
+
+    #     # Check the range of old_action_log_probs_batch - action_log_probs
+    #     diff = old_action_log_probs_batch - action_log_probs
+    #     # max_diff = diff.max().item()
+    #     # min_diff = diff.min().item()
+
+    #     # Clip diff to prevent exponent overflow
+    #     diff_clipped = torch.clamp(diff, -20, 20)
+
+    #     # Calculate the ratio and loss
+    #     ratio = torch.exp(diff_clipped)
+    #     surr1 = advantage * ratio
+    #     surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip)
+    #     a_loss = torch.max(-surr1, -surr2)
+
+    #     # Check if clipped
+    #     clipped = torch.abs(ratio - 1.0) > curr_e_clip
+    #     clipped = clipped.detach()
+        
+    #     info = {
+    #         'actor_loss': a_loss,
+    #         'actor_clipped': clipped
+    #     }
+
+    #     return info
+    
+    # DONE
+    def _fpo_loss(self, old_flow_matching_loss_batch, new_flow_matching_loss, advantage, curr_e_clip):
+        old_flow_matching_loss_batch = old_flow_matching_loss_batch.to(torch.float64)
+        new_flow_matching_loss = new_flow_matching_loss.to(torch.float64)
         advantage = advantage.to(torch.float64)
-        curr_e_clip = float(curr_e_clip)  # Ensure curr_e_clip is a float
+        curr_e_clip = float(curr_e_clip) 
 
-        # Check the range of old_action_log_probs_batch - action_log_probs
-        diff = old_action_log_probs_batch - action_log_probs
-        # max_diff = diff.max().item()
-        # min_diff = diff.min().item()
-
-        # Clip diff to prevent exponent overflow
+        diff  = (new_flow_matching_loss - old_flow_matching_loss_batch)
         diff_clipped = torch.clamp(diff, -20, 20)
+        ratio = torch.exp(5 * diff_clipped)
+        surr1 = advantage * ratio * 1e4
+        surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip) * 1e4
+        fpo_loss = torch.max(-surr1, -surr2).mean()
 
-        # Calculate the ratio and loss
-        ratio = torch.exp(diff_clipped)
-        surr1 = advantage * ratio
-        surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip)
-        a_loss = torch.max(-surr1, -surr2)
-
-        # Check if clipped
         clipped = torch.abs(ratio - 1.0) > curr_e_clip
         clipped = clipped.detach()
-        
+
         info = {
-            'actor_loss': a_loss,
-            'actor_clipped': clipped,
+            'fpo_ratio': ratio,
             'advantage': advantage,
-            'diff': diff
+            'diff': diff,
+            'fpo_loss': fpo_loss,
+            'fpo_clipped': clipped
         }
 
         return info
+    
+    def _eval_critic(self, obs_dict):
+        self.model.eval()
+        obs = obs_dict['obs']
+        # processed_obs = self._preproc_obs(obs)
+        value = self.model.eval_critic(obs).detach()
+        if self.normalize_value:
+            value = self.value_mean_std(value, True)
+        return value

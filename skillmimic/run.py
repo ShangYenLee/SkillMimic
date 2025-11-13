@@ -53,6 +53,11 @@ from learning import hrl_players_discrete #, hrl_players, hrl_players_discrete_l
 from learning import hrl_models_discrete #, hrl_models, 
 from learning import hrl_network_builder 
 
+from learning import fpo_agent
+from learning import fpo_players
+from learning import fpo_models
+from learning import fpo_network_builder
+
 # from learning import amp_agent
 # from learning import amp_players
 # from learning import amp_models
@@ -213,6 +218,11 @@ def build_alg_runner(algo_observer):
     # runner.player_factory.register_builder('ase', lambda **kwargs : ase_players.ASEPlayer(**kwargs))
     # runner.model_builder.model_factory.register_builder('ase', lambda network, **kwargs : ase_models.ModelASEContinuous(network))  
     # runner.model_builder.network_factory.register_builder('ase', lambda **kwargs : ase_network_builder.ASEBuilder())
+
+    runner.algo_factory.register_builder('fpo', lambda **kwargs : fpo_agent.FPOAgent(**kwargs))
+    runner.player_factory.register_builder('fpo', lambda **kwargs : fpo_players.FPOPlayer(**kwargs))
+    runner.model_builder.model_factory.register_builder('fpo', lambda network, **kwargs : fpo_models.FPOModel(network))  
+    runner.model_builder.network_factory.register_builder('fpo', lambda **kwargs : fpo_network_builder.FlowMatchingOptimBuilder())
  
     return runner
 
