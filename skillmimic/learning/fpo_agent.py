@@ -510,11 +510,12 @@ class FPOAgent(common_agent.CommonAgent):
         advantage = advantage.to(torch.float64)
         curr_e_clip = float(curr_e_clip) 
 
-        diff  = (new_flow_matching_loss - old_flow_matching_loss_batch)
-        diff_clipped = torch.clamp(diff, -20, 20)
-        ratio = torch.exp(5 * diff_clipped)
-        surr1 = advantage * ratio * 1e4
-        surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip) * 1e4
+        log_ratio  = (old_flow_matching_loss_batch - new_flow_matching_loss)
+        log_ratio_clipped = torch.clamp(log_ratio, -20, 20)
+        ratio = torch.exp(log_ratio_clipped)
+
+        surr1 = advantage * ratio
+        surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip)
         fpo_loss = torch.max(-surr1, -surr2).mean()
 
         clipped = torch.abs(ratio - 1.0) > curr_e_clip
