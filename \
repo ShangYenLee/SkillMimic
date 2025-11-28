@@ -1,5 +1,5 @@
 params:
-  seed: 42
+  seed: -1
 
   algo:
     name: fpo
@@ -10,7 +10,7 @@ params:
   network:
     name: fpo
     separate: True
-    num_t: 16
+    num_t: 4
 
     space:
       continuous:
@@ -50,7 +50,7 @@ params:
     normalize_advantage: True
     gamma: 0.99
     tau: 0.95
-    learning_rate: 1e-4
+    learning_rate: 1e-5
     lr_schedule: constant
     score_to_win: 20000
     max_epochs: 50000 #100000
@@ -61,17 +61,16 @@ params:
     entropy_coef: 0.0
     truncate_grads: False
     ppo: True
-    e_clip: 0.2
-    a_clip: 0.01
+    e_clip: 0.1
     horizon_length: 32
     minibatch_size: 16384 #32768 #65536 #61440 #4096 #
     mini_epochs: 6
     critic_coef: 1.2
-    clip_value: True
+    clip_value: False
     seq_len: 4
     bounds_loss_coef: 10
     enable_eps_greedy: False #Z0 #set as True in ase
     resume_from: None
-    num_integration_steps: 1000
+    num_integration_steps: 500
 
     # device: "cpu" #ZT9

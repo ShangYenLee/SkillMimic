@@ -34,7 +34,7 @@ from rl_games.common import vecenv
 
 from isaacgym.torch_utils import *
 
-import time
+import time, copy
 from datetime import datetime
 import numpy as np
 from torch import optim
@@ -54,7 +54,37 @@ class FPOAgent(common_agent.CommonAgent):
         self.resume_from = config['resume_from']
         self.done_indices = []
 
+        self.actor_params = []
+        self.critic_params = []
+
+        for name, param in self.model.named_parameters():
+            if "critic" in name or "value" in name:
+                self.critic_params.append(param)
+            else:
+                self.actor_params.append(param)
+        
+        self.actor_optim = optim.AdamW(self.actor_params, float(self.last_lr))#, eps=1e-08, weight_decay=self.weight_decay)
+        self.critic_optim = optim.AdamW(self.critic_params, float(self.last_lr))#, eps=1e-08, weight_decay=self.weight_decay)
+        # self.actor_scheduler = optim.lr_scheduler.StepLR(self.actor_optim, step_size=50, gamma=0.1)
+        # self.critic_scheduler = optim.lr_scheduler.StepLR(self.critic_optim, step_size=50, gamma=0.1)
         return
+    
+    # def _preproc_obs(self, obs_batch):
+    #     if type(obs_batch) is dict:
+    #         obs_batch = copy.copy(obs_batch)
+    #         for k, v in obs_batch.items():
+    #             if v.dtype == torch.uint8:
+    #                 obs_batch[k] = v.float() / 255.0
+    #             else:
+    #                 obs_batch[k] = v
+    #     else:
+    #         if obs_batch.dtype == torch.uint8:
+    #             obs_batch = obs_batch.float() / 255.0
+
+    #     if self._normalize_input:
+    #         obs_batch = self.running_mean_std(obs_batch)
+
+    #     return obs_batch
 
     def train(self):
         if self.resume_from != 'None':
@@ -78,18 +108,21 @@ class FPOAgent(common_agent.CommonAgent):
         super().set_eval()
         if self._normalize_input:
             self._input_mean_std.eval()
+            self.running_mean_std.eval()
         return
 
     def set_train(self):
         super().set_train()
         if self._normalize_input:
             self._input_mean_std.train()
+            self.running_mean_std.train()
         return
 
     def get_stats_weights(self):
         state = super().get_stats_weights()
         if self._normalize_input:
             state['amp_input_mean_std'] = self._input_mean_std.state_dict()
+            state['running_mean_std'] = self.running_mean_std.state_dict()
         
         return state
 
@@ -97,12 +130,13 @@ class FPOAgent(common_agent.CommonAgent):
         super().set_stats_weights(weights)
         if self._normalize_input:
             self._input_mean_std.load_state_dict(weights['amp_input_mean_std'])
+            self.running_mean_std.load_state_dict(weights['running_mean_std'])
         return
 
     def restore(self, fn):
         checkpoint = torch_ext.load_checkpoint(fn)
         self.model.load_state_dict(checkpoint['model'])
-        if self.normalize_input:
+        if self._normalize_input:
             self.running_mean_std.load_state_dict(checkpoint['running_mean_std'])
         if self._normalize_input:
             self._input_mean_std.load_state_dict(checkpoint['amp_input_mean_std'])
@@ -123,7 +157,7 @@ class FPOAgent(common_agent.CommonAgent):
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
-                res_dict = self.get_action_values(self.obs, num_integration_steps=1000)
+                res_dict = self.get_action_values(self.obs, num_integration_steps=self.num_integration_steps)
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k]) 
@@ -132,7 +166,8 @@ class FPOAgent(common_agent.CommonAgent):
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
-            shaped_rewards = self.rewards_shaper(rewards)
+            # shaped_rewards = self.rewards_shaper(rewards)
+            shaped_rewards = rewards * 100
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
             self.experience_buffer.update_data('next_obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
@@ -184,7 +219,8 @@ class FPOAgent(common_agent.CommonAgent):
         Flow Matching inference with multi-step integration
         """
         self.model.eval()
-        processed_obs = self._preproc_obs(obs_dict['obs'])
+        obs = obs_dict['obs']
+        processed_obs = self._preproc_obs(obs)
         device = processed_obs.device
 
         # 用多步積分 sample 出 action
@@ -236,7 +272,7 @@ class FPOAgent(common_agent.CommonAgent):
             dataset_dict['advantages'] = advantages
             dataset_dict['returns'] = returns
             dataset_dict['actions'] = actions
-            dataset_dict['obs'] = batch_dict['states']
+            dataset_dict['obs'] = obses
             dataset_dict['rnn_masks'] = rnn_masks
             dataset_dict['rand_action_mask'] = rand_action_mask
             self.central_value_net.update_dataset(dataset_dict)
@@ -287,6 +323,11 @@ class FPOAgent(common_agent.CommonAgent):
                 else:
                     for k, v in curr_train_info.items():
                         train_info[k].append(v)
+        
+        # self.actor_scheduler.step()
+        # self.critic_scheduler.step()
+
+        # self.last_lr = self.actor_optim.param_groups[0]['lr']
 
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
@@ -318,6 +359,7 @@ class FPOAgent(common_agent.CommonAgent):
         kl = 1.0
         lr_mul = 1.0
         curr_e_clip = lr_mul * self.e_clip
+        a_clip = self.a_clip
 
         batch_dict = {
             'is_train': True,
@@ -337,49 +379,68 @@ class FPOAgent(common_agent.CommonAgent):
             values = res_dict['values']
             entropy = res_dict['entropy']
 
-            fpo_info = self._fpo_loss(old_flow_matching_loss_batch, new_flow_matching_loss, advantage, curr_e_clip)
-            f_loss = fpo_info['fpo_loss']
-            f_clipped = fpo_info['fpo_clipped'].float()
+            a_info = self._actor_loss(old_flow_matching_loss_batch, new_flow_matching_loss, advantage, curr_e_clip)
+            a_loss = a_info['actor_loss']
+            a_clipped = a_info['actor_clipped'].float()
             c_info = self._critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
             c_loss = c_info['critic_loss']
 
             # b_loss = self.bound_loss(mu)
             
             c_loss = torch.mean(c_loss)
-            f_loss = torch.sum(rand_action_mask * f_loss) / rand_action_sum
+            a_loss = torch.sum(rand_action_mask * a_loss) / rand_action_sum
             entropy = torch.sum(rand_action_mask * entropy) / rand_action_sum
             # b_loss = torch.sum(rand_action_mask * b_loss) / rand_action_sum
-            f_clip_frac = torch.sum(rand_action_mask * f_clipped) / rand_action_sum
+            a_clip_frac = torch.sum(rand_action_mask * a_clipped) / rand_action_sum
             
-            loss = f_loss - self.entropy_coef * entropy + c_loss * self.critic_coef
+            # loss = a_loss - self.entropy_coef * entropy + c_loss * self.critic_coef
 
-            fpo_info['fpo_loss'] = f_loss
-            fpo_info['fpo_clip_frac'] = f_clip_frac
+            a_info['actor_loss'] = a_loss
+            a_info['actor_clip_frac'] = a_clip_frac
             c_info['critic_loss'] = c_loss
 
-            if self.multi_gpu:
-                self.optimizer.zero_grad()
-            else:
-                for param in self.model.parameters():
-                    param.grad = None
+            self.actor_optim.zero_grad()
+            # self.scaler.scale(a_loss).backward(retain_graph=True)
+            # self.scaler.unscale_(self.actor_optim)
+            a_loss.backward()
+            for n, p in enumerate(self.actor_params):
+                if p.grad is not None and torch.isnan(p.grad).any():
+                    print("💥 NAN GRAD:", n)
+            nn.utils.clip_grad_norm_(self.actor_params, self.grad_norm)
+            # self.scaler.step(self.actor_optim)
+            self.actor_optim.step()
 
-        self.scaler.scale(loss).backward()
-        if self.truncate_grads:
-            if self.multi_gpu:
-                self.optimizer.synchronize()
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-                with self.optimizer.skip_synchronize():
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-            else:
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()    
-        else:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.critic_optim.zero_grad()
+            # self.scaler.scale(c_loss).backward()
+            # self.scaler.unscale_(self.critic_optim)
+            c_loss.backward()
+            nn.utils.clip_grad_norm_(self.critic_params, self.grad_norm)
+            # self.scaler.step(self.critic_optim)
+            self.critic_optim.step()
+
+        #     if self.multi_gpu:
+        #         self.optimizer.zero_grad()
+        #     else:
+        #         for param in self.model.parameters():
+        #             param.grad = None
+
+        # self.scaler.scale(loss).backward()
+        # if self.truncate_grads:
+        #     if self.multi_gpu:
+        #         self.optimizer.synchronize()
+        #         self.scaler.unscale_(self.optimizer)
+        #         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+        #         with self.optimizer.skip_synchronize():
+        #             self.scaler.step(self.optimizer)
+        #             self.scaler.update()
+        #     else:
+        #         self.scaler.unscale_(self.optimizer)
+        #         nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm)
+        #         self.scaler.step(self.optimizer)
+        #         self.scaler.update()    
+        # else:
+        #     self.scaler.step(self.optimizer)
+        #     self.scaler.update()
 
         # with torch.no_grad():
             # compute KL
@@ -387,11 +448,10 @@ class FPOAgent(common_agent.CommonAgent):
         self.train_result = {
             'entropy': entropy,
             'last_lr': self.last_lr, 
-            'lr_mul': lr_mul, 
-            'loss': loss
+            'lr_mul': lr_mul
             # 'b_loss': b_loss
         }
-        self.train_result.update(fpo_info)
+        self.train_result.update(a_info)
         self.train_result.update(c_info)
 
         return
@@ -408,6 +468,8 @@ class FPOAgent(common_agent.CommonAgent):
         self._enable_eps_greedy = bool(config['enable_eps_greedy'])
         self._amp_observation_space = self.env_info['amp_observation_space']
         self._normalize_input = config.get('normalize_input', True)
+        self.num_integration_steps = config.get('num_integration_steps', 500)
+        self.a_clip = config.get('a_clip', 0.01)
         return
 
     def _build_net_config(self):
@@ -439,9 +501,11 @@ class FPOAgent(common_agent.CommonAgent):
         rand_action_mask = batch_dict['rand_action_mask']
 
         advantages = returns - values
-        advantages = torch.sum(advantages, axis=1)
+        # advantages = torch.sum(advantages, axis=1)
+        advantages = advantages.squeeze(-1)
         if self.normalize_advantage:
-            advantages = torch_ext.normalization_with_masks(advantages, rand_action_mask)
+            # advantages = torch_ext.normalization_with_masks(advantages, rand_action_mask)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         return advantages
     
@@ -455,19 +519,19 @@ class FPOAgent(common_agent.CommonAgent):
         self.writer.add_scalar('performance/update_time', train_info['update_time'], frame)
         self.writer.add_scalar('performance/play_time', train_info['play_time'], frame)
         # self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(train_info['actor_loss']).item(), frame)
-        self.writer.add_scalar('losses/fpo_loss', torch_ext.mean_list(train_info['fpo_loss']).item(), frame)
+        self.writer.add_scalar('losses/actor_loss', torch_ext.mean_list(train_info['actor_loss']).item(), frame)
         self.writer.add_scalar('losses/fpo_ratio', torch_ext.mean_list(train_info['fpo_ratio']).item(), frame)
         self.writer.add_scalar('losses/advantage', torch_ext.mean_list(train_info['advantage']).item(), frame)
         self.writer.add_scalar('losses/diff', torch_ext.mean_list(train_info['diff']).item(), frame)
-        self.writer.add_scalar('losses/c_loss', torch_ext.mean_list(train_info['critic_loss']).item(), frame)
-        self.writer.add_scalar('losses/total_loss', torch_ext.mean_list(train_info['loss']).item(), frame)
+        self.writer.add_scalar('losses/critic_loss', torch_ext.mean_list(train_info['critic_loss']).item(), frame)
+        # self.writer.add_scalar('losses/total_loss', torch_ext.mean_list(train_info['loss']).item(), frame)
         
         # self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(train_info['b_loss']).item(), frame)
         self.writer.add_scalar('losses/entropy', torch_ext.mean_list(train_info['entropy']).item(), frame)
         self.writer.add_scalar('info/last_lr', train_info['last_lr'][-1] * train_info['lr_mul'][-1], frame)
         self.writer.add_scalar('info/lr_mul', train_info['lr_mul'][-1], frame)
         self.writer.add_scalar('info/e_clip', self.e_clip * train_info['lr_mul'][-1], frame)
-        self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['fpo_clip_frac']).item(), frame)
+        # self.writer.add_scalar('info/clip_frac', torch_ext.mean_list(train_info['fpo_clip_frac']).item(), frame)
         # self.writer.add_scalar('info/kl', torch_ext.mean_list(train_info['kl']).item(), frame)
         return
     
@@ -504,28 +568,32 @@ class FPOAgent(common_agent.CommonAgent):
     #     return info
     
     # DONE
-    def _fpo_loss(self, old_flow_matching_loss_batch, new_flow_matching_loss, advantage, curr_e_clip):
+    def _actor_loss(self, old_flow_matching_loss_batch, new_flow_matching_loss, advantage, curr_e_clip):
         old_flow_matching_loss_batch = old_flow_matching_loss_batch.to(torch.float64)
         new_flow_matching_loss = new_flow_matching_loss.to(torch.float64)
         advantage = advantage.to(torch.float64)
         curr_e_clip = float(curr_e_clip) 
 
-        diff  = (new_flow_matching_loss - old_flow_matching_loss_batch)
-        diff_clipped = torch.clamp(diff, -20, 20)
-        ratio = torch.exp(5 * diff_clipped)
-        surr1 = advantage * ratio * 1e4
-        surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip) * 1e4
-        fpo_loss = torch.max(-surr1, -surr2).mean()
+        diff  = (old_flow_matching_loss_batch.detach()  - new_flow_matching_loss)
+        diff_clipped = torch.clamp(diff, -10, 10)
+        ratio = torch.exp(diff_clipped)
+        surr1 = advantage * ratio
+        surr2 = advantage * torch.clamp(ratio, 1.0 - curr_e_clip, 1.0 + curr_e_clip)
+        actor_loss = -torch.min(surr1, surr2)
 
         clipped = torch.abs(ratio - 1.0) > curr_e_clip
         clipped = clipped.detach()
+        # print("a_loss:", actor_loss)
+        # print("surr1 max:", surr1.max())
+        # print("ratio max:", ratio.max())
+        # print("advantage max:", advantage.max())
 
         info = {
             'fpo_ratio': ratio,
             'advantage': advantage,
             'diff': diff,
-            'fpo_loss': fpo_loss,
-            'fpo_clipped': clipped
+            'actor_loss': actor_loss,
+            'actor_clipped': clipped
         }
 
         return info
@@ -533,8 +601,16 @@ class FPOAgent(common_agent.CommonAgent):
     def _eval_critic(self, obs_dict):
         self.model.eval()
         obs = obs_dict['obs']
-        # processed_obs = self._preproc_obs(obs)
-        value = self.model.eval_critic(obs).detach()
+        processed_obs = self._preproc_obs(obs)
+        value = self.model.eval_critic(processed_obs).detach()
         if self.normalize_value:
             value = self.value_mean_std(value, True)
         return value
+
+    # def _critic_loss(self, value_preds_batch, values, curr_e_clip, return_batch, clip_value):
+    #     c_loss = nn.functional.mse_loss()
+
+    #     info = {
+    #         'critic_loss': c_loss
+    #     }
+    #     return info

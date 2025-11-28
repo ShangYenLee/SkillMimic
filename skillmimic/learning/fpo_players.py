@@ -126,11 +126,13 @@ class FPOPlayer(common_player.CommonPlayer):
                     # print(n)
                     obs_dict = self.env_reset(done_indices)
 
-                    if has_masks:
-                        masks = self.env.get_action_mask()
-                        action = self.get_masked_action(obs_dict, masks, is_determenistic)
-                    else:
-                        action = self.get_action(obs_dict, is_determenistic)
+                    # if has_masks:
+                    #     masks = self.env.get_action_mask()
+                    #     action = self.get_masked_action(obs_dict, masks, is_determenistic)
+                    # else:
+                    #     action = self.get_action(obs_dict, is_determenistic)
+                    print("fpo get action")
+                    action = self.get_action(obs_dict, is_determenistic)
 
                     # a_out = fid.g_a_out #fid #V1
                     # hidden_sim.append(a_out)
@@ -345,11 +347,11 @@ class FPOPlayer(common_player.CommonPlayer):
     def _amp_debug(self, info):
         return
 
-    def get_action(self, obs_dict):
+    def get_action(self, obs_dict, is_determenistic=False):
         obs = obs_dict['obs']
         if hasattr(self, '_preproc_obs'):
             obs = self._preproc_obs(obs)
         with torch.no_grad():
-            output = self.model.sample_action(obs, num_steps=100)
+            output = self.model.sample_action(obs, num_steps=1000)
         return output
 

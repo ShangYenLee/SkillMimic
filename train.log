@@ -1,0 +1,36 @@
+Importing module 'gym_38' (/home/yuuna/isaacgym/python/isaacgym/_bindings/linux-x86_64/gym_38.so)
+Setting GYM_USD_PLUG_INFO_PATH to /home/yuuna/isaacgym/python/isaacgym/_bindings/linux-x86_64/usd/plugInfo.json
+PyTorch version 2.4.1+cu121
+Device count 4
+/home/yuuna/isaacgym/python/isaacgym/_bindings/src/gymtorch
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Using /home/yuuna/.cache/torch_extensions/py38_cu121 as PyTorch extensions root...
+Emitting ninja build file /home/yuuna/.cache/torch_extensions/py38_cu121/gymtorch/build.ninja...
+Building extension module gymtorch...
+Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+ninja: no work to do.
+Loading extension module gymtorch...
+Not connected to PVD
++++ Using GPU PhysX
+Physics Engine: PhysX
+Physics Device: cuda:0
+GPU Pipeline: enabled
+Using VHACD cache directory '/home/yuuna/.isaacgym/vhacd'
+/home/yuuna/SkillMimic/skillmimic/utils/motion_data_handler.py:73: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  hoi_data = torch.load(seq_path)
+/home/yuuna/miniconda3/envs/skillmimic/lib/python3.8/site-packages/gym/spaces/box.py:127: UserWarning: [33mWARN: Box bound precision lowered by casting to float32[0m
+  logger.warn(f"Box bound precision lowered by casting to {self.dtype}")
+/home/yuuna/miniconda3/envs/skillmimic/lib/python3.8/site-packages/rl_games/common/a2c_common.py:175: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  self.scaler = torch.cuda.amp.GradScaler(enabled=self.mixed_precision)
+/home/yuuna/miniconda3/envs/skillmimic/lib/python3.8/site-packages/torch/_inductor/compile_fx.py:150: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/home/yuuna/SkillMimic/skillmimic/learning/fpo_agent.py:376: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+W1128 11:55:20.424715 140678475489408 torch/_dynamo/convert_frame.py:762] [2/8] torch._dynamo hit config.cache_size_limit (8)
+W1128 11:55:20.424715 140678475489408 torch/_dynamo/convert_frame.py:762] [2/8]    function: 'check' (/home/yuuna/SkillMimic/skillmimic/learning/fpo_network_builder.py:189)
+W1128 11:55:20.424715 140678475489408 torch/_dynamo/convert_frame.py:762] [2/8]    last reason: GLOBAL_STATE changed: grad_mode 
+W1128 11:55:20.424715 140678475489408 torch/_dynamo/convert_frame.py:762] [2/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W1128 11:55:20.424715 140678475489408 torch/_dynamo/convert_frame.py:762] [2/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html.
